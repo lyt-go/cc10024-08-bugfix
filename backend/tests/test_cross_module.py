@@ -407,6 +407,171 @@ def test_export_channel_creates_file():
     assert os.path.getsize(path) > 0
 
 
+
+# ---------------------------------------------------------------------------
+# 页面快照采集来源的持久化
+# ---------------------------------------------------------------------------
+def _reset_page_artifacts():
+    from app.store import store
+    from app.services.page_snapshot import SOURCE_LOG
+    from app import persistence as persist
+
+    for sub in ["snapshots", "reports", "runs"]:
+        path = persist.data_path(sub, "")
+        if os.path.isdir(path):
+            for name in os.listdir(path):
+                os.remove(os.path.join(path, name))
+    store.rows("page_snapshot").clear()
+    store.rows("run_history").clear()
+    for rule in store.rows("page_dedup"):
+        rule["status"] = "已生效"
+    assert SOURCE_LOG
+
+
+def test_same_hash_two_urls_keeps_both_sources():
+    """两个 URL 传同一个 DOM 摘要：两个来源都要落盘，不能被末次写入覆盖。"""
+    from app.services.page_snapshot import PageSnapshotService
+
+    _reset_page_artifacts()
+    svc = PageSnapshotService()
+    a = svc.capture_snapshot("https://a.example/p", "same-hash", "<p>same</p>")
+    b = svc.capture_snapshot("https://b.example/p", "same-hash", "<p>same</p>")
+    assert a["source_id"] != b["source_id"]
+    sources = svc.list_snapshot_sources()
+    assert {s["page_url"] for s in sources} == {"https://a.example/p", "https://b.example/p"}
+    content = svc.get_content("same-hash")
+    assert content is not None
+    assert set(content["page_urls"]) == {"https://a.example/p", "https://b.example/p"}
+    assert {a["source_id"], b["source_id"]} <= set(content["source_ids"])
+
+
+def test_replay_does_not_add_source():
+    """同一 URL 重放同一采集不另计来源，只累加抓取次数。"""
+    from app.services.page_snapshot import PageSnapshotService
+
+    _reset_page_artifacts()
+    svc = PageSnapshotService()
+    first = svc.capture_snapshot("https://a.example/p", "h1", "<p>x</p>")
+    again = svc.capture_snapshot("https://a.example/p", "h1", "<p>x</p>")
+    assert again["source_id"] == first["source_id"]
+    assert again["replayed"] is True
+    assert again["capture_count"] == 2
+    assert len(svc.list_snapshot_sources()) == 1
+
+
+def test_source_lookup_survives_refresh():
+    """刷新后按来源身份与指纹独立回查，来源身份与持久内容一致。"""
+    from app.store import store
+    from app.services.page_snapshot import PageSnapshotService
+
+    _reset_page_artifacts()
+    svc = PageSnapshotService()
+    captured = svc.capture_snapshot("https://a.example/p", "h2", "<p>x</p>")
+    store.rows("page_snapshot").clear()  # 模拟刷新：内存行丢失
+    reloaded = svc.get_snapshot_source(captured["source_id"])
+    assert reloaded is not None
+    assert reloaded["page_url"] == "https://a.example/p"
+    assert reloaded["dom_hash"] == "h2"
+    by_fingerprint = svc.sources_for_fingerprint("h2")
+    assert [s["source_id"] for s in by_fingerprint] == [captured["source_id"]]
+
+
+def test_recycle_one_source_keeps_other_content():
+    """回收一个来源后，另一个引用同一正文的来源仍能回查摘要。"""
+    from app.services.page_snapshot import PageSnapshotService
+
+    _reset_page_artifacts()
+    svc = PageSnapshotService()
+    a = svc.capture_snapshot("https://a.example/p", "h3", "<p>x</p>")
+    b = svc.capture_snapshot("https://b.example/p", "h3", "<p>x</p>")
+    record, message = svc.recycle_snapshot_source(a["source_id"])
+    assert record is not None and record["status"] == "已回收", message
+    assert svc.get_snapshot_source(a["source_id"])["status"] == "已回收"
+    assert svc.get_snapshot_source(b["source_id"])["status"] == "已存档"
+    content = svc.get_content("h3")
+    assert content is not None
+    assert b["source_id"] in content["active_source_ids"]
+    assert a["source_id"] not in content["active_source_ids"]
+    assert set(content["page_urls"]) == {"https://a.example/p", "https://b.example/p"}
+
+
+def test_run_receipt_merges_same_content_and_links_pages():
+    """两次运行分别采到同一正文，回执按正文合并分组并能回查原始 URL。"""
+    from app.store import store
+    from app.services.page_snapshot import PageSnapshotService
+    from app.services.run_history import RunHistoryService
+
+    _reset_page_artifacts()
+    snap = PageSnapshotService()
+    runs = RunHistoryService()
+
+    run1, _ = runs.create_entry({
+        "记录编号": "TEST-SNAP-RUN-1", "关联计划": "PLAN-1", "开始时间": "2026-11-22T00:00:00"})
+    run2, _ = runs.create_entry({
+        "记录编号": "TEST-SNAP-RUN-2", "关联计划": "PLAN-2", "开始时间": "2026-11-22T00:00:00"})
+
+    snap.register_capture("https://a.example/p", "shared", "<p>same</p>", run_id=run1["id"])
+    snap.register_capture("https://b.example/p", "shared", "<p>same</p>", run_id=run2["id"])
+
+    runs.run_action(run1["id"], "确认完成")
+    runs.run_action(run2["id"], "确认完成")
+
+    pages1 = runs.get_captured_pages(run1["id"])
+    pages2 = runs.get_captured_pages(run2["id"])
+    assert [p["page_url"] for p in pages1] == ["https://a.example/p"]
+    assert [p["page_url"] for p in pages2] == ["https://b.example/p"]
+
+    entry1 = runs.get_entry(run1["id"])
+    assert entry1["page_urls"] == ["https://a.example/p"]
+    assert entry1["fingerprints"] == ["shared"]
+
+    # 回收其中一个来源后，仍有效的运行记录仍能找回原始 URL 与摘要。
+    snap.recycle_snapshot_source(pages1[0]["source_id"])
+    entry1 = runs.get_entry(run1["id"])
+    entry1_pages = entry1["captured_pages"]
+    assert entry1_pages[0]["page_url"] == "https://a.example/p"
+    assert entry1_pages[0]["dom_hash"] == "shared"
+    assert entry1_pages[0]["status"] == "已回收"
+    entry2 = runs.get_entry(run2["id"])
+    assert entry2["captured_pages"][0]["page_url"] == "https://b.example/p"
+    assert entry2["captured_pages"][0]["status"] == "已存档"
+
+
+def test_run_dedup_receipt_groups_same_content():
+    """运行去重回执读取快照来源记录，合并相同正文的内容分组。"""
+    from app.store import store
+    from app.services.page_dedup import PageDedupService
+    from app.services.page_snapshot import PageSnapshotService
+    from app.services.run_history import RunHistoryService
+    from app import persistence as persist
+
+    _reset_page_artifacts()
+    snap = PageSnapshotService()
+    runs = RunHistoryService()
+    dedup = PageDedupService()
+
+    run, _ = runs.create_entry({
+        "记录编号": "TEST-SNAP-RUN-3", "关联计划": "PLAN-3", "开始时间": "2026-11-22T00:00:00"})
+    snap.register_capture("https://a.example/p", "dup", "<p>same</p>", run_id=run["id"])
+    snap.register_capture("https://b.example/p", "dup", "<p>same</p>", run_id=run["id"])
+    runs.run_action(run["id"], "确认完成")
+
+    receipt = store.find("run_history", run["id"])["dedup_receipt"]
+    assert receipt["total_sources"] == 2
+    assert receipt["unique_contents"] == 1
+    assert receipt["duplicates"] == 1
+    assert receipt["merged_groups"] == 1
+    assert receipt["run_sources"] == 2
+
+    groups = dedup.build_content_groups()
+    assert len(groups) == 1 and groups[0]["count"] == 2
+
+    reports = persist.read_jsonl("reports", "dedup_report.jsonl")
+    latest = [r for r in reports if r.get("run_id") == run["id"]][-1]
+    assert latest["groups"][0]["page_urls"] == ["https://a.example/p", "https://b.example/p"]
+    assert sorted(latest["run_source_ids"]) == sorted(latest["source_ids"])
+
+
 if __name__ == "__main__":
     test_script_to_schedule_flow()
     print("PASS: test_script_to_schedule_flow")
@@ -436,4 +601,16 @@ if __name__ == "__main__":
     print("PASS: test_page_dedup_fingerprint")
     test_export_channel_creates_file()
     print("PASS: test_export_channel_creates_file")
-    print("\nALL 14 TESTS PASSED")
+    test_same_hash_two_urls_keeps_both_sources()
+    print("PASS: test_same_hash_two_urls_keeps_both_sources")
+    test_replay_does_not_add_source()
+    print("PASS: test_replay_does_not_add_source")
+    test_source_lookup_survives_refresh()
+    print("PASS: test_source_lookup_survives_refresh")
+    test_recycle_one_source_keeps_other_content()
+    print("PASS: test_recycle_one_source_keeps_other_content")
+    test_run_receipt_merges_same_content_and_links_pages()
+    print("PASS: test_run_receipt_merges_same_content_and_links_pages")
+    test_run_dedup_receipt_groups_same_content()
+    print("PASS: test_run_dedup_receipt_groups_same_content")
+    print("\nALL 20 TESTS PASSED")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any, Callable
 
 from app.store import store
@@ -24,9 +25,6 @@ def register_hook(module: str, action: str, callback: Callable[[dict[str, Any]],
     if key not in _CROSS_MODULE_HOOKS:
         _CROSS_MODULE_HOOKS[key] = []
     _CROSS_MODULE_HOOKS[key].append(callback)
-
-
-import json
 
 
 class BaseModuleService:

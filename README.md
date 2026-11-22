@@ -77,5 +77,33 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 页面快照采集来源
+
+页面快照不再用 `page_<DOM摘要>.json` 覆盖式存档：两个 URL 采到同一份正文时，
+后写入的不会再抹掉先写入的来源。落盘结构：
+
+| 文件 | 内容 |
+| --- | --- |
+| `data/snapshots/page_sources.jsonl` | 采集来源事件流（capture / claim / recycle / restore） |
+| `data/snapshots/page_src_<来源>.json` | 单个来源的最新快照，来源身份、URL、DOM摘要、内容指纹一一对应 |
+| `data/snapshots/page_<指纹>.json` | 按正文指纹归档的内容索引，记录全部关联来源与仍有效的来源 |
+
+来源身份由 `(URL, DOM摘要)` 稳定派生：同一 URL 重放同一采集只增加抓取次数、
+不新增来源；不同 URL 即使正文相同也各自保留来源记录。相关入口：
+
+```text
+POST /api/page_snapshot/capture                     采集一次页面快照
+GET  /api/page_snapshot/sources                     列出来源（可含已回收）
+GET  /api/page_snapshot/sources/{source_id}         按来源身份回查
+POST /api/page_snapshot/sources/{source_id}/recycle 回收一个来源
+GET  /api/page_snapshot/fingerprints/{fingerprint}  按正文指纹回查内容与来源
+GET  /api/run_history/{entry_id}                    运行记录（含 captured_pages）
+GET  /api/run_history/{entry_id}/sources            该运行实际采到的页面
+```
+
+运行历史确认完成时会认领本次运行实际采到的来源，按正文指纹合并内容分组并写
+`data/reports/run_dedup_receipts.jsonl`；回收一个来源不会影响其他引用同一正文
+的来源，也不会让仍有效的运行记录丢失原始 URL 与摘要。
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA

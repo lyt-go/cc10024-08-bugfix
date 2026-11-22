@@ -36,3 +36,13 @@ export type OverviewResult = {
   cards: { label: string; value: number }[]
   modules: { name: string; created: number; pending: number; abnormal: number }[]
 }
+
+export type RunSourceRow = {
+  source_id: string
+  page_url: string
+  dom_hash: string
+  fingerprint: string
+  status: string
+  captured_at?: string
+  content_ref?: string
+}

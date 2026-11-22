@@ -1,6 +1,6 @@
 import { request } from './client'
 import { moduleMeta } from '@/data/modules'
-import type { ActionResult, EntryRow, OverviewResult, PageResult } from '@/data/types'
+import type { ActionResult, EntryRow, OverviewResult, PageResult, RunSourceRow } from '@/data/types'
 
 export { moduleMeta }
 
@@ -52,6 +52,13 @@ export async function downloadEntries(
   anchor.click()
   document.body.removeChild(anchor)
   URL.revokeObjectURL(url)
+}
+
+export async function listRunSources(id: number): Promise<RunSourceRow[]> {
+  const response = await request(`/api/run_history/${id}/sources`)
+  if (!response.ok) throw new Error('采集来源读取失败')
+  const payload = await response.json()
+  return payload.items as RunSourceRow[]
 }
 
 export async function loadOverview(): Promise<OverviewResult> {

@@ -60,6 +60,15 @@
             >
               {{ action }}
             </button>
+            <button
+              v-if="meta.key === 'run_history'"
+              class="link"
+              type="button"
+              :data-testid="`lookup-sources-${row.id}`"
+              @click="openRunSources(row)"
+            >
+              回查采集来源
+            </button>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -69,6 +78,32 @@
         </tr>
       </tbody>
     </table>
+
+    <div v-if="sourceRows" class="modal-backdrop" data-testid="run-sources-modal">
+      <section class="modal">
+        <h3>运行 {{ sourceRunCode }} 实际采到的页面</h3>
+        <table class="data-table">
+          <thead>
+            <tr><th>采集来源</th><th>DOM摘要</th><th>内容指纹</th><th>来源状态</th><th>快照文件</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="page in sourceRows" :key="String(page.source_id)" :data-testid="`run-source-${page.source_id}`">
+              <td>{{ page.page_url || '—' }}</td>
+              <td>{{ page.dom_hash || '—' }}</td>
+              <td>{{ page.fingerprint || '—' }}</td>
+              <td>{{ page.status }}</td>
+              <td>{{ page.content_ref || '—' }}</td>
+            </tr>
+            <tr v-if="!sourceRows.length">
+              <td colspan="5" class="empty-state">该运行没有关联到采集来源</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="page-actions">
+          <button class="btn" type="button" @click="sourceRows = null">关闭</button>
+        </div>
+      </section>
+    </div>
 
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
@@ -100,10 +135,11 @@ import {
   createEntry,
   downloadEntries,
   listEntries,
+  listRunSources,
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
-import type { EntryRow } from '@/data/types'
+import type { EntryRow, RunSourceRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
@@ -113,6 +149,8 @@ const errorMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
+const sourceRows = ref<RunSourceRow[] | null>(null)
+const sourceRunCode = ref('')
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
 const stats = computed(() => [
@@ -173,6 +211,16 @@ async function runAction(action: string, row: EntryRow) {
     await reload()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '操作失败'
+  }
+}
+
+async function openRunSources(row: EntryRow) {
+  errorMessage.value = ''
+  try {
+    sourceRows.value = await listRunSources(Number(row.id))
+    sourceRunCode.value = String(row['记录编号'] ?? row.id)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '采集来源读取失败'
   }
 }
 
